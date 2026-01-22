@@ -1,6 +1,6 @@
 # BrainTrain
 
-Deep learning pipeline for self supervised learning, classification and explainability for brain MRI analysis.
+Deep learning pipeline for brain MRI analysis.
 
 ## Overview
 
