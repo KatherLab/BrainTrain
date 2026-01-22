@@ -41,7 +41,7 @@ pip install -r requirements.txt
 ### CSV Files
 
 Your CSV files should contain:
-- `eid` (or `subject_id`) - Subject identifier (first column)
+- `eid` - Subject identifier (first column)
 - `label` - Target variable (integer for classification, float for regression)
 
 Example:
@@ -53,6 +53,7 @@ sub002,0
 
 ### Image Files 
 
+(If you have DCMs, run preprocessing.py to get npy tensors first.)
 After preprocessing:
 - **Format:** NumPy arrays saved as `.npy` files
 - **Shape:** `(96, 96, 96)` for 3D MRI volumes
@@ -62,13 +63,15 @@ After preprocessing:
 
 ### 1. Configure Paths
 
-Edit [config.py](config.py) to set your data paths:
+Edit [config.py](config.py) to set all your desired input and output paths:
 
 ```python
 TRAIN_COHORT = 'your-cohort-name'
 TENSOR_DIR = f'../images/{TRAIN_COHORT}/npy96'
 CSV_TRAIN = f'../data/{TRAIN_COHORT}/train/data.csv'
 ```
+
+Make sure to create differnt data and image folders for train and test cohorts.
 
 ### 2. Preprocess MRI Data
 
@@ -83,15 +86,8 @@ Preprocessing pipeline:
 4. Skull stripping
 5. Resampling to 96×96×96
 
-### 3. Self-Supervised Pretraining (Optional)
 
-```bash
-python ssl_train.py
-```
-
-Train a self-supervised backbone on unlabeled brain MRI data. The pretrained model can be used for transfer learning in subsequent steps.
-
-### 4. Train Model
+### 3. Train Model
 
 ```bash
 # Train with default settings (LoRA fine-tuning)
@@ -107,7 +103,7 @@ python train.py --mode lora --column label --gpu cuda:0
 - `ssl-finetuned` - Fine-tune SSL pretrained model
 - `lora` - LoRA adaptation (parameter-efficient)
 
-### 5. Evaluate Model
+### 4. Evaluate Model
 
 ```bash
 python test.py
@@ -118,7 +114,7 @@ Generates:
 - Confusion matrix
 - Classification metrics (accuracy, precision, recall, F1, AUC)
 
-### 6. Generate Explainability Maps
+### 5. Generate Explainability Maps
 
 ```bash
 python heatmap.py
@@ -129,25 +125,22 @@ Creates:
 - Regional attribution analysis using AAL atlas
 - Top-N most important brain regions per prediction
 
-## Configuration
+### 6. Self-Supervised Pretraining (Optional)
 
-Key settings in [config.yaml]:
-
-```python
-# Training
-BATCH_SIZE = 16
-LEARNING_RATE = 0.001
-NUM_EPOCHS = 1000
-PATIENCE = 20  # Early stopping
-
-# Model
-TRAINING_MODE = 'lora'
-N_CLASSES = 2
-
-# LoRA
-LORA_RANK = 16
-LORA_ALPHA = 64
+```bash
+python ssl_train.py
 ```
+
+Train a self-supervised backbone on unlabeled brain MRI data. The pretrained model can be used for transfer learning in subsequent steps.
+
+### 7. Features representation
+
+```bash
+python features.py
+```
+
+Extract features from the self-supervised pretrained model and visualize them as uMaps or tSNEs.
+
 
 ## Project Structure
 
@@ -168,7 +161,7 @@ BrainTrain/
 
 ## Outputs
 
-Results are saved to parent directory:
+Results can be saved to parent directory (or whatever locaton is suitable):
 - `../models/` - Model checkpoints
 - `../scores/` - Prediction scores
 - `../logs/` - Training logs
