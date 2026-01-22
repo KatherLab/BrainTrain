@@ -1,59 +1,176 @@
 # BrainTrain
 
-Deep learning pipeline for brain MRI classification with explainability.
+Deep learning pipeline for self supervised learning, classification and explainability for brain MRI analysis.
 
 ## Overview
 
-Train and evaluate deep learning models on brain MRI data with explainability methods to visualize model predictions.
+Train and evaluate deep learning models on 3D brain MRI data with support for self-supervised learning (SSL) pretraining, LoRA fine-tuning, and explainability visualizations using GradCAM and saliency maps.
 
 ## Features
 
-- **Training** - Train deep learning models on brain MRI scans
-- **Testing** - Evaluate model performance on test sets
-- **Explainability** - Generate GradCAM and saliency maps for predictions
+- **Multiple Training Modes** - SFCN, linear probing, SSL fine-tuning, and LoRA
+- **Self-Supervised Learning** - Pretrain on unlabeled brain MRI data
+- **Evaluation** - ROC/PRC curves, confusion matrices, bootstrap confidence intervals
+- **Explainability** - GradCAM and saliency maps with AAL atlas region analysis
+- **Preprocessing** - DICOM to NIfTI conversion, bias correction, registration, skull stripping, resampling npy transformations
 
-## Project Structure
+## Installation
 
+### Prerequisites
+
+- Python 3.8+
+- CUDA-compatible GPU 
+
+### Setup
+
+```bash
+# Clone the repository
+git clone <repo-url>
+cd BrainTrain
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
 ```
-.
-├── architectures/          # Neural network models
-├── dataloaders/           # Dataset loaders
-├── src/          # Neural network models
-├── dataloaders/           # Dataset loaders
-├── train.py               # Model training script
-├── test.py                # Model evaluation script
-├── heatmap.py             # GradCAM and saliency visualization
-└── config.py              # Configuration and paths
+
+## Data Format
+
+### CSV Files
+
+Your CSV files should contain:
+- `eid` (or `subject_id`) - Subject identifier (first column)
+- `label` - Target variable (integer for classification, float for regression)
+
+Example:
+```csv
+eid,label
+sub001,1
+sub002,0
 ```
+
+### Image Files 
+
+After preprocessing:
+- **Format:** NumPy arrays saved as `.npy` files
+- **Shape:** `(96, 96, 96)` for 3D MRI volumes
+- **Naming:** Filename must match `eid` in CSV (e.g., `sub001.npy`)
 
 ## Quick Start
 
-### 1. Train Model
+### 1. Configure Paths
 
-```bash
-python train.py
+Edit [config.py](config.py) to set your data paths:
+
+```python
+TRAIN_COHORT = 'your-cohort-name'
+TENSOR_DIR = f'../images/{TRAIN_COHORT}/npy96'
+CSV_TRAIN = f'../data/{TRAIN_COHORT}/train/data.csv'
 ```
 
-Trains the model on your brain MRI dataset and saves checkpoints.
+### 2. Preprocess MRI Data
 
-### 2. Test Model
+```bash
+python preprocess.py
+```
+
+Preprocessing pipeline:
+1. DICOM to NIfTI conversion
+2. N4 bias field correction
+3. Registration to MNI template
+4. Skull stripping
+5. Resampling to 96×96×96
+
+### 3. Self-Supervised Pretraining (Optional)
+
+```bash
+python ssl_train.py
+```
+
+Train a self-supervised backbone on unlabeled brain MRI data. The pretrained model can be used for transfer learning in subsequent steps.
+
+### 4. Train Model
+
+```bash
+# Train with default settings (LoRA fine-tuning)
+python train.py
+
+# Train with specific options
+python train.py --mode lora --column label --gpu cuda:0
+```
+
+**Training modes:**
+- `sfcn` - Train SFCN from scratch
+- `linear` - Linear probing (frozen SSL backbone)
+- `ssl-finetuned` - Fine-tune SSL pretrained model
+- `lora` - LoRA adaptation (parameter-efficient)
+
+### 5. Evaluate Model
 
 ```bash
 python test.py
 ```
 
-Evaluates the trained model on the test set and reports performance metrics.
+Generates:
+- ROC and Precision-Recall curves with bootstrap CI
+- Confusion matrix
+- Classification metrics (accuracy, precision, recall, F1, AUC)
 
-### 3. Generate Explainability Maps
+### 6. Generate Explainability Maps
 
 ```bash
 python heatmap.py
 ```
 
+Creates:
+- GradCAM or saliency maps overlaid on MRI scans
+- Regional attribution analysis using AAL atlas
+- Top-N most important brain regions per prediction
+
 ## Configuration
 
-Edit `config.py` to customize:
-- Data paths
-- Model architecture
-- Training hyperparameters
-- Explainability settings
+Key settings in [config.yaml]:
+
+```python
+# Training
+BATCH_SIZE = 16
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 1000
+PATIENCE = 20  # Early stopping
+
+# Model
+TRAINING_MODE = 'lora'
+N_CLASSES = 2
+
+# LoRA
+LORA_RANK = 16
+LORA_ALPHA = 64
+```
+
+## Project Structure
+
+```
+BrainTrain/
+├── utils/
+│   ├── architectures/      # Neural network models
+│   ├── dataloaders/        # Dataset loaders
+│   ├── augmentations/      # SSL augmentations
+│   └── ...
+├── preprocess.py           # MRI preprocessing
+├── ssl_train.py            # Self-supervised pretraining
+├── train.py                # Model training
+├── test.py                 # Model evaluation
+├── heatmap.py              # Explainability visualization
+└── config.py               # Configuration
+```
+
+## Outputs
+
+Results are saved to parent directory:
+- `../models/` - Model checkpoints
+- `../scores/` - Prediction scores
+- `../logs/` - Training logs
+- `../evaluations/` - Evaluation plots
+- `../explainability/` - Heatmaps
