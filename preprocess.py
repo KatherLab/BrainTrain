@@ -11,7 +11,7 @@ import config as cfg
 # Globals
 # ============================================================
 
-fixed = ants.image_read(cfg.template_path)
+fixed = ants.image_read(cfg.TEMPLATE_PATH)
 
 # ============================================================
 # Stage 1: DICOM → NIfTI
@@ -20,7 +20,7 @@ fixed = ants.image_read(cfg.template_path)
 def dcm_to_nifti(dcm_dir):
     try:
         dcm_dir = Path(dcm_dir)
-        out_dir = Path(cfg.input_folder)
+        out_dir = Path(cfg.INPUT_FOLDER)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         out_nii = out_dir / f"{dcm_dir.name}.nii.gz"
@@ -50,9 +50,9 @@ def dcm_to_nifti(dcm_dir):
 
 def bias_correct(filename):
     try:
-        in_path  = Path(cfg.input_folder) / filename
+        in_path  = Path(cfg.INPUT_FOLDER) / filename
         out_name = filename.replace(".nii.gz", "_n4.nii.gz")
-        out_path = Path(cfg.n4_folder) / out_name
+        out_path = Path(cfg.N4_FOLDER) / out_name
 
         if out_path.exists():
             print(f"[SKIP][N4] {out_name}")
@@ -77,9 +77,9 @@ def register(n4_name):
         if not n4_name:
             return
 
-        in_path  = Path(cfg.n4_folder) / n4_name
+        in_path  = Path(cfg.N4_FOLDER) / n4_name
         out_name = n4_name.replace("_n4.nii.gz", "_registered.nii.gz")
-        out_path = Path(cfg.reg_folder) / out_name
+        out_path = Path(cfg.REG_FOLDER) / out_name
 
         if out_path.exists():
             print(f"[SKIP][REG] {out_name}")
@@ -90,7 +90,7 @@ def register(n4_name):
         reg = ants.registration(
             fixed=fixed,
             moving=moving,
-            type_of_transform=cfg.reg_type
+            type_of_transform=cfg.REGISTRATION_TYPE
         )
         ants.image_write(reg["warpedmovout"], str(out_path))
         return out_name
@@ -108,9 +108,9 @@ def deskull(reg_name, gpu_id=0):
         if not reg_name:
             return
 
-        in_path  = Path(cfg.reg_folder) / reg_name
+        in_path  = Path(cfg.REG_FOLDER) / reg_name
         out_name = reg_name.replace("_registered.nii.gz", "_deskulled.nii.gz")
-        out_path = Path(cfg.deskull_folder) / out_name
+        out_path = Path(cfg.DESKULL_FOLDER) / out_name
 
         if out_path.exists():
             print(f"[SKIP][BET] {out_name}")
@@ -131,8 +131,8 @@ def deskull(reg_name, gpu_id=0):
 
 def nifti_to_npy(nii_name):
     try:
-        nii_path = Path(cfg.deskull_folder) / nii_name
-        npy_path = Path(cfg.npy_folder) / nii_name.replace("_deskulled.nii.gz", ".npy")
+        nii_path = Path(cfg.DESKULL_FOLDER) / nii_name
+        npy_path = Path(cfg.NPY_FOLDER) / nii_name.replace("_deskulled.nii.gz", ".npy")
 
         if npy_path.exists():
             print(f"[SKIP][NPY] {npy_path.name}")
@@ -140,8 +140,8 @@ def nifti_to_npy(nii_name):
 
         transforms = tio.Compose([
             tio.Resample((1, 1, 1)),
-            tio.CropOrPad((cfg.crop_size, cfg.crop_size, cfg.crop_size)),
-            tio.Resize((cfg.img_size, cfg.img_size, cfg.img_size)),
+            tio.CropOrPad((cfg.CROP_SIZE, cfg.CROP_SIZE, cfg.CROP_SIZE)),
+            tio.Resize((cfg.IMG_SIZE, cfg.IMG_SIZE, cfg.IMG_SIZE)),
             tio.ZNormalization()
         ])
 
@@ -166,21 +166,21 @@ if __name__ == "__main__":
 
     # Create folders
     for folder in [
-        cfg.dcm_folder,
-        cfg.input_folder,
-        cfg.n4_folder,
-        cfg.reg_folder,
-        cfg.deskull_folder,
-        cfg.npy_folder,
+        cfg.DCM_FOLDER,
+        cfg.INPUT_FOLDER,
+        cfg.N4_FOLDER,
+        cfg.REG_FOLDER,
+        cfg.DESKULL_FOLDER,
+        cfg.NPY_FOLDER,
     ]:
         Path(folder).mkdir(parents=True, exist_ok=True)
 
     # ---- DICOM → NIfTI ----
     print("\n=== DICOM → NIfTI ===")
     dcm_dirs = [
-        Path(cfg.dcm_folder) / d
-        for d in os.listdir(cfg.dcm_folder)
-        if (Path(cfg.dcm_folder) / d).is_dir()
+        Path(cfg.DCM_FOLDER) / d
+        for d in os.listdir(cfg.DCM_FOLDER)
+        if (Path(cfg.DCM_FOLDER) / d).is_dir()
     ]
     print(f"Total DICOM dirs: {len(dcm_dirs)}")
 
@@ -214,4 +214,4 @@ if __name__ == "__main__":
     for f in deskulled_files:
         nifti_to_npy(f)
 
-    print(f"\n[DONE] Total NPYS: {len(os.listdir(cfg.npy_folder))}")
+    print(f"\n[DONE] Total NPYS: {len(os.listdir(cfg.NPY_FOLDER))}")
