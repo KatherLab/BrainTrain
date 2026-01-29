@@ -21,8 +21,8 @@ def get_criterion(device, train_labels=None):
             criterion = nn.CrossEntropyLoss().to(device)
 
     elif cfg.TASK == 'regression':
-        criterion = nn.MSELoss().to(device)
-        print("Using MSE Loss for regression")
+        criterion = nn.L1Loss().to(device)
+        print("Using MAE (L1) Loss for regression")
 
     else:
         raise ValueError(f"Invalid TASK: {cfg.TASK}")

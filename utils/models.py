@@ -2,7 +2,66 @@
 import config as cfg
 from utils.architectures import sfcn_cls, sfcn_ssl2, head, lora_layers
 import torch
+import torch.nn as nn
 import monai
+
+try:
+    from monai.networks.nets import SwinTransformer as MonaiSwinTransformer
+except Exception:  # pragma: no cover - fallback for older MONAI
+    from monai.networks.nets.swin_unetr import SwinTransformer as MonaiSwinTransformer
+
+
+def _pick_patch_size(img_size):
+    for size in (4, 2, 1):
+        if img_size % size == 0:
+            return size
+    return 1
+
+
+def _pick_window_size(patch_grid):
+    for size in (7, 6, 4, 3, 2):
+        if patch_grid % size == 0:
+            return size
+    return 2
+
+
+class SwinTransformerClassifier(nn.Module):
+    def __init__(self, output_dim):
+        super().__init__()
+        if cfg.SWIN_PATCH_SIZE and cfg.SWIN_WINDOW_SIZE:
+            patch_size = tuple(cfg.SWIN_PATCH_SIZE)
+            window_size = tuple(cfg.SWIN_WINDOW_SIZE)
+        else:
+            patch_size = _pick_patch_size(cfg.IMG_SIZE)
+            patch_grid = max(cfg.IMG_SIZE // patch_size, 1)
+            window_size = _pick_window_size(patch_grid)
+            patch_size = (patch_size, patch_size, patch_size)
+            window_size = (window_size, window_size, window_size)
+
+        self.backbone = MonaiSwinTransformer(
+            in_chans=cfg.N_CHANNELS,
+            embed_dim=96,
+            window_size=window_size,
+            patch_size=patch_size,
+            depths=(2, 2, 6, 2),
+            num_heads=(3, 6, 12, 24),
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            drop_rate=0.0,
+            attn_drop_rate=0.0,
+            drop_path_rate=0.1,
+            use_checkpoint=False,
+            spatial_dims=3,
+        )
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.classifier = nn.LazyLinear(output_dim)
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        if isinstance(feats, (list, tuple)):
+            feats = feats[-1]
+        feats = self.pool(feats).flatten(1)
+        return self.classifier(feats)
 
 def create_model(device):
     """Create model based on training mode and task"""
@@ -17,6 +76,15 @@ def create_model(device):
         model = monai.networks.nets.DenseNet121(spatial_dims=3, in_channels=cfg.N_CHANNELS, out_channels=output_dim).to(device)
         optimizer = torch.optim.AdamW(model.parameters(), cfg.LEARNING_RATE)
         print(f"Using DenseNet121 for {cfg.TASK}")
+
+    elif cfg.TRAINING_MODE == 'swin':
+        model = SwinTransformerClassifier(output_dim=output_dim).to(device)
+        # Initialize lazy head before parameter counting
+        with torch.no_grad():
+            dummy = torch.zeros(1, cfg.N_CHANNELS, cfg.IMG_SIZE, cfg.IMG_SIZE, cfg.IMG_SIZE, device=device)
+            _ = model(dummy)
+        optimizer = torch.optim.AdamW(model.parameters(), cfg.LEARNING_RATE)
+        print(f"Using SwinTransformer for {cfg.TASK}")
     
     elif cfg.TRAINING_MODE in ['linear', 'ssl-finetuned']:
         backbone = sfcn_ssl2.SFCN()

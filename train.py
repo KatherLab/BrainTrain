@@ -309,6 +309,18 @@ def train():
     
     save_predictions(train_eids, train_lbls, train_preds, train_pred_path)
     save_predictions(best_val_eids, best_val_labels, best_val_outputs, val_pred_path)
+
+    # Fit and save bias correction coefficients on validation data (regression only)
+    if cfg.TASK == 'regression' and getattr(cfg, 'APPLY_BIAS_CORRECTION', False):
+        try:
+            from test import fit_and_save_bias_correction_coefficients
+            fit_and_save_bias_correction_coefficients(
+                y_val_true=best_val_labels,
+                y_val_pred=best_val_outputs,
+                save_path=cfg.BIAS_CORRECTION_COEFFICIENTS_PATH
+            )
+        except Exception as exc:
+            print(f"\n⚠️  Bias correction calibration failed: {exc}")
     
     # Calculate computational statistics
     avg_epoch_time = np.mean(epoch_times)

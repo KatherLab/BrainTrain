@@ -211,7 +211,7 @@ if __name__ == "__main__":
 
     # ---- TorchIO → NPY ----
     print("\n=== TorchIO → NPY ===")
-    for f in deskulled_files:
-        nifti_to_npy(f)
+    with mp.Pool(cfg.NUM_WORKERS) as pool:
+        npy_files = list(filter(None, pool.map(nifti_to_npy, deskulled_files)))
 
-    print(f"\n[DONE] Total NPYS: {len(os.listdir(cfg.NPY_FOLDER))}")
+    print(f"\n[DONE] Total NPYS: {len(npy_files)}")

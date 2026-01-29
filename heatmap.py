@@ -31,7 +31,52 @@ def find_last_conv_layer(model):
     return last_conv
 
 
-def compute_gradcam(model, image, target_layer, target='logit_diff', class_idx=None, mode='magnitude'):
+def _resolve_target(logits, target, class_idx=None, label=None):
+    is_regression = cfg.TASK == 'regression' or logits.ndim == 1 or logits.shape[1] == 1
+    pred_value = None
+    conf = None
+
+    if is_regression:
+        pred_value = float(logits.view(-1)[0].item())
+        pred_class = None
+        if target in ('output', 'pred', 'logit_diff'):
+            score = logits.view(-1)[0]
+        elif target == 'loss':
+            if label is None:
+                raise ValueError("label is required when target='loss' for regression")
+            score = (logits.view(-1)[0] - label) ** 2
+        else:
+            raise ValueError(f"Unknown target: {target}")
+    else:
+        probs = torch.softmax(logits, dim=1)
+        pred_class = torch.argmax(probs, dim=1).item()
+        conf = probs[0, pred_class].item()
+
+        if target == 'logit_diff' and logits.shape[1] == 2:
+            score = (logits[0, 1] - logits[0, 0])
+            pred_class = int(probs[0, 1] > probs[0, 0])
+            conf = probs[0, pred_class].item()
+        elif target == 'pred':
+            score = logits[0, pred_class]
+        elif target == 'target_class':
+            if class_idx is None:
+                raise ValueError("Must specify class_idx when target='target_class'")
+            score = logits[0, class_idx]
+            conf = probs[0, class_idx].item()
+        elif target == 'loss':
+            if label is None:
+                raise ValueError("label is required when target='loss' for classification")
+            label_t = torch.tensor([int(label)], device=logits.device)
+            score = F.cross_entropy(logits, label_t)
+        elif target == 'output':
+            raise ValueError("output is not valid for classification")
+        else:
+            raise ValueError(f"Unknown target: {target}")
+
+    return score, pred_class, conf, pred_value
+
+
+def compute_gradcam(model, image, target_layer, target='logit_diff', class_idx=None, mode='magnitude', label=None):
     """
     Compute GradCAM attention map using intermediate layer activations.
     
@@ -39,14 +84,14 @@ def compute_gradcam(model, image, target_layer, target='logit_diff', class_idx=N
         model: PyTorch model
         image: Input image tensor [1,1,D,H,W]
         target_layer: Layer to compute gradients for
-        target: 'logit_diff' (default), 'pred', or 'target_class'
+        target: 'logit_diff' (default), 'pred', 'target_class', 'output' (regression), or 'loss'
         class_idx: Target class index (only used if target='target_class')
         mode: 'magnitude' (ReLU applied) or 'signed' (preserve sign)
     
     Returns:
         gradcam: Attention map [D,H,W]
-        pred_class: Predicted class
-        confidence: Prediction confidence
+        pred_class: Predicted class (None for regression)
+        confidence: Prediction confidence (None for regression)
     """
     activations = []
     gradients = []
@@ -65,25 +110,9 @@ def compute_gradcam(model, image, target_layer, target='logit_diff', class_idx=N
         # Forward pass
         model.zero_grad(set_to_none=True)
         logits = model(image)
-        probs = torch.softmax(logits, dim=1)
-        
-        # Determine target and get predictions
-        if target == 'logit_diff' and logits.shape[1] == 2:
-            score = (logits[0, 1] - logits[0, 0])
-            pred_class = int(probs[0, 1] > probs[0, 0])
-            conf = probs[0, pred_class].item()
-        elif target == 'pred':
-            pred_class = torch.argmax(probs, dim=1).item()
-            score = logits[0, pred_class]
-            conf = probs[0, pred_class].item()
-        elif target == 'target_class':
-            if class_idx is None:
-                raise ValueError("Must specify class_idx when target='target_class'")
-            pred_class = torch.argmax(probs, dim=1).item()
-            score = logits[0, class_idx]
-            conf = probs[0, class_idx].item()
-        else:
-            raise ValueError(f"Unknown target: {target}")
+        score, pred_class, conf, pred_value = _resolve_target(
+            logits, target, class_idx=class_idx, label=label
+        )
         
         # Backward pass
         score.backward()
@@ -116,7 +145,7 @@ def compute_gradcam(model, image, target_layer, target='logit_diff', class_idx=N
             if max_abs > 0:
                 cam = cam / max_abs
         
-        return cam, pred_class, conf
+        return cam, pred_class, conf, pred_value
     
     finally:
         handle_f.remove()
@@ -152,45 +181,29 @@ def quantify_regions(heatmap, atlas_path, label_dict, signed=False):
     
     return region_scores
 
-def compute_saliency(model, image, target='logit_diff', class_idx=None, mode='magnitude'):
+def compute_saliency(model, image, target='logit_diff', class_idx=None, mode='magnitude', label=None):
     """
     Compute saliency map (gradient of output w.r.t. input).
     
     Args:
         model: PyTorch model
         image: Input image tensor [1,1,D,H,W]
-        target: 'logit_diff' (default), 'pred', or 'target_class'
+        target: 'logit_diff' (default), 'pred', 'target_class', 'output' (regression), or 'loss'
         class_idx: Target class index (only used if target='target_class')
         mode: 'magnitude' (absolute value) or 'signed' (preserve sign)
     
     Returns:
         saliency: Attention map [D,H,W]
-        pred_class: Predicted class
-        confidence: Prediction confidence
+        pred_class: Predicted class (None for regression)
+        confidence: Prediction confidence (None for regression)
     """
     image.requires_grad = True
     model.zero_grad(set_to_none=True)
     
     logits = model(image)
-    probs = torch.softmax(logits, dim=1)
-    
-    # Determine target
-    if target == 'logit_diff' and logits.shape[1] == 2:
-        score = (logits[0, 1] - logits[0, 0])
-        pred_class = int(probs[0, 1] > probs[0, 0])
-        conf = probs[0, pred_class].item()
-    elif target == 'pred':
-        pred_class = torch.argmax(probs, dim=1).item()
-        score = logits[0, pred_class]
-        conf = probs[0, pred_class].item()
-    elif target == 'target_class':
-        if class_idx is None:
-            raise ValueError("Must specify class_idx when target='target_class'")
-        pred_class = torch.argmax(probs, dim=1).item()
-        score = logits[0, class_idx]
-        conf = probs[0, class_idx].item()
-    else:
-        raise ValueError(f"Unknown target: {target}")
+    score, pred_class, conf, pred_value = _resolve_target(
+        logits, target, class_idx=class_idx, label=label
+    )
     
     # Backward
     score.backward()
@@ -209,7 +222,7 @@ def compute_saliency(model, image, target='logit_diff', class_idx=None, mode='ma
             saliency = saliency / max_abs
     
     image.requires_grad = False
-    return saliency, pred_class, conf
+    return saliency, pred_class, conf, pred_value
 
 
 def load_image(path, device):
@@ -324,8 +337,11 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
     if attention_method == 'gradcam':
         target_layer = find_last_conv_layer(model)
     
-    # Load CSV data
-    df = pd.read_csv(cfg.CSV_TEST)
+    # Load CSV data (respect NROWS when provided)
+    if cfg.NROWS is None:
+        df = pd.read_csv(cfg.CSV_TEST)
+    else:
+        df = pd.read_csv(cfg.CSV_TEST, nrows=cfg.NROWS)
     print(f"Test dataset size: {len(df)}")
     
     # Create test dataset
@@ -333,9 +349,9 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
         csv_file=cfg.CSV_TEST,
         root_dir=cfg.TENSOR_DIR_TEST,
         column_name=cfg.COLUMN_NAME,
-        num_rows=None,
+        num_rows=cfg.NROWS,
         num_classes=cfg.N_CLASSES,
-        task='classification'
+        task=cfg.TASK
     )
     
     print(f"Test dataset size: {len(test_dataset)}")
@@ -356,7 +372,10 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
         else:
             eid = str(eid_raw)  # Already a string
 
-        label = int(row[cfg.COLUMN_NAME])
+        if cfg.TASK == 'regression':
+            label = float(row[cfg.COLUMN_NAME])
+        else:
+            label = int(row[cfg.COLUMN_NAME])
         
         # Construct image path
         image_path = os.path.join(cfg.TENSOR_DIR_TEST, f"{eid}.npy")
@@ -371,25 +390,36 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
         
         # Compute attention
         if attention_method == 'gradcam':
-            att_map, pred_class, confidence = compute_gradcam(
+            att_map, pred_class, confidence, pred_value = compute_gradcam(
                 model, image_t, target_layer,
                 target=attention_target,
                 class_idx=attention_class_idx,
-                mode=attention_mode
+                mode=attention_mode,
+                label=label
             )
         else:  # saliency
-            att_map, pred_class, confidence = compute_saliency(
+            att_map, pred_class, confidence, pred_value = compute_saliency(
                 model, image_t,
                 target=attention_target,
                 class_idx=attention_class_idx,
-                mode=attention_mode
+                mode=attention_mode,
+                label=label
             )
+        
+        if cfg.TASK == 'regression':
+            pred_value = float(pred_value)
+            error = float(abs(pred_value - label))
+            confidence = None
+        else:
+            error = None
         
         results.append({
             'heatmap': att_map,
             'image': image_np,
             'confidence': confidence,
             'pred_class': pred_class,
+            'pred_value': pred_value,
+            'error': error,
             'true_class': label,
             'eid': eid
         })
@@ -416,15 +446,17 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
     
     if mode == 'single':
         result = results[0]
-        save_visualization(
-            result['heatmap'], result['image'],
-            f"single_{result['eid']}_pred{result['pred_class']}_conf{result['confidence']:.3f}",
-            heatmap_dir,
-            signed=signed
-        )
+        if cfg.TASK == 'regression':
+            name = f"single_{result['eid']}_pred{result['pred_value']:.3f}_err{result['error']:.3f}"
+        else:
+            name = f"single_{result['eid']}_pred{result['pred_class']}_conf{result['confidence']:.3f}"
+        save_visualization(result['heatmap'], result['image'], name, heatmap_dir, signed=signed)
     
     elif mode == 'average':
-        top_results = sorted(results, key=lambda x: x['confidence'], reverse=True)[:top_n]
+        if cfg.TASK == 'regression':
+            top_results = sorted(results, key=lambda x: x['error'])[:top_n]
+        else:
+            top_results = sorted(results, key=lambda x: x['confidence'], reverse=True)[:top_n]
         avg_heatmap = np.mean([r['heatmap'] for r in top_results], axis=0)
         save_visualization(
             avg_heatmap, results[0]['image'], 
@@ -434,27 +466,35 @@ def generate_heatmaps(heatmap_dir, attention_method='gradcam',
         )
     
     elif mode == 'top_individual':
-        positive_results = [r for r in results if r['pred_class'] == 1]
-        
-        if not positive_results:
-            print(f"WARNING: No predictions for class 1 found! Using all predictions instead.")
-            positive_results = results
-        
-        top_positive = sorted(positive_results, key=lambda x: x['confidence'], reverse=True)[:top_n]
-        # ... rest of code
-        for i, result in enumerate(top_positive):
-            save_visualization(
-                result['heatmap'], result['image'],
-                f"top{i+1}_{result['eid']}_conf{result['confidence']:.3f}",
-                heatmap_dir,
-                signed=signed
-            )
+        if cfg.TASK == 'regression':
+            top_results = sorted(results, key=lambda x: x['error'])[:top_n]
+            for i, result in enumerate(top_results):
+                name = f"top{i+1}_{result['eid']}_pred{result['pred_value']:.3f}_err{result['error']:.3f}"
+                save_visualization(result['heatmap'], result['image'], name, heatmap_dir, signed=signed)
+        else:
+            positive_results = [r for r in results if r['pred_class'] == 1]
+            
+            if not positive_results:
+                print("WARNING: No predictions for class 1 found! Using all predictions instead.")
+                positive_results = results
+            
+            top_positive = sorted(positive_results, key=lambda x: x['confidence'], reverse=True)[:top_n]
+            # ... rest of code
+            for i, result in enumerate(top_positive):
+                save_visualization(
+                    result['heatmap'], result['image'],
+                    f"top{i+1}_{result['eid']}_conf{result['confidence']:.3f}",
+                    heatmap_dir,
+                    signed=signed
+                )
     
     # Save summary
     summary_df = pd.DataFrame([{
         'eid': r['eid'],
         'pred_class': r['pred_class'],
+        'pred_value': r['pred_value'],
         'true_class': r['true_class'],
+        'error': r['error'],
         'confidence': r['confidence']
     } for r in results])
     
@@ -503,7 +543,7 @@ def main():
         attention_mode=attention_mode,
         mode=mode,
         top_n=top_n,
-        attention_target='logit_diff',
+        attention_target=cfg.ATTENTION_TARGET,
         attention_class_idx=None,
         atlas_path=atlas_path,
         label_dict=label_dict
