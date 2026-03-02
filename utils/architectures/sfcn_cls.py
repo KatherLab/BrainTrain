@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import config as cfg
+import BrainTrain.config as cfg
 
 class SFCN(nn.Module):
     def __init__(self, channel_number=[32, 64, 128, 256, 256, 64], output_dim=cfg.N_CLASSES, dropout=True):
@@ -29,7 +29,7 @@ class SFCN(nn.Module):
                                                                   kernel_size=1,
                                                                   padding=0))
         self.classifier = nn.Sequential()
-        avg_shape = [3, 3, 3]
+        avg_shape = [5, 5, 5]
         self.classifier.add_module('average_pool', nn.AvgPool3d(avg_shape))
         if dropout is True:
             self.classifier.add_module('dropout', nn.Dropout(0.5))
