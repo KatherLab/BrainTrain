@@ -1,5 +1,5 @@
 
-import config as cfg
+import BrainTrain.config as cfg
 from utils.architectures import sfcn_cls, sfcn_ssl2, head, lora_layers
 import torch
 import torch.nn as nn
@@ -40,7 +40,7 @@ class SwinTransformerClassifier(nn.Module):
 
         self.backbone = MonaiSwinTransformer(
             in_chans=cfg.N_CHANNELS,
-            embed_dim=96,
+            embed_dim=48,
             window_size=window_size,
             patch_size=patch_size,
             depths=(2, 2, 6, 2),

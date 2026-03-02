@@ -11,13 +11,14 @@ from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay,
     precision_score, recall_score, f1_score, balanced_accuracy_score,
     mean_squared_error, mean_absolute_error, r2_score)
+from sklearn.preprocessing import label_binarize
 from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from utils.dataloaders import dataloader
 from utils.architectures import sfcn_cls, sfcn_ssl2, head, lora_layers
-from utils import models
-import config as cfg
+from utils import models, label_mapping
+import BrainTrain.config as cfg
 import seaborn as sns
 from lifelines import KaplanMeierFitter
 from lifelines.statistics import logrank_test
@@ -145,6 +146,44 @@ def plot_confusion_matrix(y_true, y_score, threshold='youden', save_path=None):
         'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp,
         'accuracy': acc, 'precision': prec, 'recall': rec,
         'specificity': spec, 'f1': f1, 'balanced_accuracy': bacc
+    }
+
+
+def plot_multiclass_confusion_matrix(y_true, y_pred, n_classes, save_path=None):
+    """Plot multiclass confusion matrix and return macro metrics."""
+    labels = list(range(n_classes))
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=labels,
+        yticklabels=labels,
+        cbar=False
+    )
+    plt.xlabel("Predicted Class")
+    plt.ylabel("True Class")
+    plt.title(f"Confusion Matrix — {cfg.TRAINING_MODE} on {cfg.TEST_COHORT}")
+    plt.tight_layout()
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Confusion matrix saved to {save_path}")
+    plt.close()
+
+    return {
+        'accuracy': accuracy_score(y_true, y_pred),
+        'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+        'precision_macro': precision_score(y_true, y_pred, average='macro', zero_division=0),
+        'recall_macro': recall_score(y_true, y_pred, average='macro', zero_division=0),
+        'f1_macro': f1_score(y_true, y_pred, average='macro', zero_division=0),
+        'precision_weighted': precision_score(y_true, y_pred, average='weighted', zero_division=0),
+        'recall_weighted': recall_score(y_true, y_pred, average='weighted', zero_division=0),
+        'f1_weighted': f1_score(y_true, y_pred, average='weighted', zero_division=0),
     }
 
 #%%
@@ -558,7 +597,7 @@ def load_or_calibrate_bias_correction_coefficients(coeff_path, validation_data=N
     # If file doesn't exist and validation data is provided, calibrate
     if validation_data is not None:
         y_val_true, y_val_pred = validation_data
-        print(f"\n⚠️  Coefficient file not found: {coeff_path}")
+        print(f"\n Coefficient file not found: {coeff_path}")
         print(f"   Calibrating bias correction on validation set ({len(y_val_true)} samples)...")
         
         from sklearn.linear_model import LinearRegression
@@ -631,10 +670,13 @@ def get_validation_predictions(model, val_loader, device):
             
             images = images.to(device)
             outputs = model(images)
-            
-            if outputs.dim() > 1:
-                outputs = outputs.squeeze()
-            val_outputs.extend(outputs.cpu().tolist())
+
+            # Keep regression outputs as a flat 1D list even for batch_size=1.
+            if isinstance(outputs, torch.Tensor):
+                outputs_list = outputs.detach().reshape(-1).cpu().tolist()
+            else:
+                outputs_list = torch.as_tensor(outputs).reshape(-1).cpu().tolist()
+            val_outputs.extend(outputs_list)
     
     return val_labels, val_outputs
 
@@ -684,7 +726,7 @@ def apply_linear_bias_correction(y_true, y_pred, coefficients=None, fit_on_data=
             )
     
     if fit_on_data:
-        print("\n⚠️  WARNING: Fitting bias correction on test data!")
+        print("\nWARNING: Fitting bias correction on test data!")
         print("    This causes information leakage and inflates performance metrics.")
         print("    For correct methodology, fit on validation data only.")
         print("    Proceeding with current data for backward compatibility...\n")
@@ -721,6 +763,12 @@ def apply_linear_bias_correction(y_true, y_pred, coefficients=None, fit_on_data=
             'fitted_on': 'validation_set (no information leakage)'
         }
     
+    # Guard against invalid slope to avoid inf/NaN
+    if not np.isfinite(slope) or abs(slope) < 1e-12:
+        print("⚠️  Bias correction skipped: slope is non-finite or too small.")
+        correction_info['bias_correction_skipped'] = True
+        return y_pred.copy(), correction_info
+
     # Apply correction: corrected = (predicted - β₀) / β₁
     y_pred_corrected = (y_pred - intercept) / slope
     
@@ -857,6 +905,26 @@ def test(model_path, output_dir, log_dir):
     if hasattr(cfg, 'KAPLAN_MEIER') and cfg.KAPLAN_MEIER:
         print(f"  Kaplan-Meier: {km_dir}")
     
+    class_to_index = None
+    if cfg.TASK == 'classification':
+        class_to_index = label_mapping.resolve_or_create_label_mapping(
+            csv_path=cfg.CSV_TRAIN,
+            column_name=cfg.COLUMN_NAME,
+            mapping_path=cfg.LABEL_MAP_PATH,
+            auto_create=getattr(cfg, "LABEL_MAP_AUTO", False),
+        )
+        if class_to_index is not None:
+            mapped_n_classes = len(class_to_index)
+            if cfg.N_CLASSES_EXPLICIT and cfg.N_CLASSES != mapped_n_classes:
+                raise ValueError(
+                    f"N_CLASSES={cfg.N_CLASSES} does not match label map size "
+                    f"{mapped_n_classes} at {cfg.LABEL_MAP_PATH}"
+                )
+            if not cfg.N_CLASSES_EXPLICIT and cfg.N_CLASSES != mapped_n_classes:
+                print(f"Updating N_CLASSES from {cfg.N_CLASSES} to {mapped_n_classes} based on label map.")
+                cfg.N_CLASSES = mapped_n_classes
+            print(f"Using label map: {cfg.LABEL_MAP_PATH}")
+
     # Load model
     model = models.load_model(model_path, device)
     
@@ -867,14 +935,15 @@ def test(model_path, output_dir, log_dir):
         column_name=cfg.COLUMN_NAME,
         num_rows=cfg.NROWS,
         num_classes=cfg.N_CLASSES,
-        task=cfg.TASK
+        task=cfg.TASK,
+        label_mapping=class_to_index,
     )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=cfg.BATCH_SIZE,
         num_workers=cfg.NUM_WORKERS,
-        drop_last=False)
+        drop_last=True)
     
     print(f"Test dataset size: {len(test_dataset)}")
     
@@ -887,7 +956,8 @@ def test(model_path, output_dir, log_dir):
             column_name=cfg.COLUMN_NAME,
             num_rows=cfg.NROWS,
             num_classes=cfg.N_CLASSES,
-            task=cfg.TASK
+            task=cfg.TASK,
+            label_mapping=class_to_index,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -905,35 +975,32 @@ def test(model_path, output_dir, log_dir):
                              output_dir, log_dir, subdir, device, val_loader=val_loader)
 
 def test_classification(model, test_loader, test_dataset, output_dir, log_dir, subdir, device):
-    """Test function for classification task"""
-    
-    # Run inference
-    test_outputs = []
+    """Test function for classification task (binary and multiclass)."""
+
+    test_prob_batches = []
     test_labels = []
     test_eids = []
-    
+
     print("\nRunning inference...")
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
             eid, images, labels = batch
-            binary_labels = labels[:, 1]
-            test_labels.extend(binary_labels.tolist())
-            
+            true_classes = torch.argmax(labels, dim=1)
+            test_labels.extend(true_classes.tolist())
+
             test_eids.extend(eid)
             images = images.to(device)
-            labels = labels.float().to(device)
-            
+
             outputs = model(images)
             probs = F.softmax(outputs, dim=1)
-            binary_outputs = probs[:, 1]
-            test_outputs.extend(binary_outputs.tolist())
-    
-    # Convert to numpy
-    y_true = np.array(test_labels).astype(float)
-    y_score = np.array(test_outputs).astype(float)
-    
-    return test_classification_metrics(y_true, y_score, test_eids, test_labels,
-                                       output_dir, log_dir, subdir)
+            test_prob_batches.append(probs.cpu().numpy())
+
+    y_true = np.array(test_labels).astype(int)
+    y_prob = np.concatenate(test_prob_batches, axis=0).astype(float)
+
+    return test_classification_metrics(
+        y_true, y_prob, test_eids, test_labels, output_dir, log_dir, subdir
+    )
 
 def test_regression(model, test_loader, test_dataset, output_dir, log_dir, subdir, device, val_loader=None):
     """Test function for regression task"""
@@ -954,11 +1021,13 @@ def test_regression(model, test_loader, test_dataset, output_dir, log_dir, subdi
             labels = labels.float().to(device)
             
             outputs = model(images)
-            
-            # For regression, output is a single value
-            if outputs.dim() > 1:
-                outputs = outputs.squeeze()
-            test_outputs.extend(outputs.tolist())
+
+            # Keep regression outputs as a flat 1D list even for batch_size=1.
+            if isinstance(outputs, torch.Tensor):
+                outputs_list = outputs.detach().reshape(-1).cpu().tolist()
+            else:
+                outputs_list = torch.as_tensor(outputs).reshape(-1).cpu().tolist()
+            test_outputs.extend(outputs_list)
     
     # Convert to numpy
     y_true = np.array(test_labels).astype(float)
@@ -968,201 +1037,251 @@ def test_regression(model, test_loader, test_dataset, output_dir, log_dir, subdi
                                    output_dir, log_dir, subdir, 
                                    val_loader=val_loader, device=device, model=model)
 
-def test_classification_metrics(y_true, y_score, test_eids, test_labels, output_dir, log_dir, subdir):
-    """Calculate and save classification metrics"""
-    
-    # Calculate metrics with bootstrapping
+def test_classification_metrics(y_true, y_prob, test_eids, test_labels, output_dir, log_dir, subdir):
+    """Calculate and save classification metrics (binary and multiclass)."""
+
     print("\nCalculating metrics...")
-    auroc = roc_auc_score(y_true, y_score)
-    auprc = average_precision_score(y_true, y_score)
-    
-    bootstrapped_auroc = []
-    bootstrapped_auprc = []
-    rng = np.random.RandomState(42)
-    
-    for _ in range(1000):
-        indices = rng.randint(0, len(y_true), len(y_true))
-        y_true_sample = y_true[indices]
-        y_score_sample = y_score[indices]
-        
-        if len(np.unique(y_true_sample)) < 2:
-            continue
-        
-        bootstrapped_auroc.append(roc_auc_score(y_true_sample, y_score_sample))
-        bootstrapped_auprc.append(average_precision_score(y_true_sample, y_score_sample))
-    
-    ci_auroc_lower = np.percentile(bootstrapped_auroc, 2.5)
-    ci_auroc_upper = np.percentile(bootstrapped_auroc, 97.5)
-    ci_auprc_lower = np.percentile(bootstrapped_auprc, 2.5)
-    ci_auprc_upper = np.percentile(bootstrapped_auprc, 97.5)
-    
-    print("\n" + "="*70)
-    print("CLASSIFICATION RESULTS")
-    print("="*70)
-    print(f"AUROC: {auroc:.3f} (95% CI: {ci_auroc_lower:.3f}–{ci_auroc_upper:.3f})")
-    print(f"AUPRC: {auprc:.3f} (95% CI: {ci_auprc_lower:.3f}–{ci_auprc_upper:.3f})")
-    print("="*70)
-    
-    # Create directory structure for classification
+    n_classes = y_prob.shape[1]
+    y_pred = np.argmax(y_prob, axis=1).astype(int)
+
     roc_dir = os.path.join(log_dir, 'roc', subdir)
     prc_dir = os.path.join(log_dir, 'prc', subdir)
     cm_dir = os.path.join(log_dir, 'cm', subdir)
     metrics_dir = os.path.join(log_dir, 'metrics', subdir)
     summary_dir = os.path.join(log_dir, 'summary', subdir)
     scores_dir = os.path.join(output_dir, subdir)
-    
+
     for directory in [roc_dir, prc_dir, cm_dir, metrics_dir, summary_dir, scores_dir]:
         os.makedirs(directory, exist_ok=True)
-    
-    # Save predictions
+
     predictions_df = pd.DataFrame({
         'eid': test_eids,
         'label': test_labels,
-        'prediction': y_score
+        'pred_class': y_pred
     })
+    for cls_idx in range(n_classes):
+        predictions_df[f'prob_class_{cls_idx}'] = y_prob[:, cls_idx]
 
     pred_path = os.path.join(scores_dir, f'{cfg.EXPERIMENT_NAME}.csv')
     predictions_df.to_csv(pred_path, index=False)
     print(f"\nPredictions saved to {pred_path}")
-    
-    # Save summary metrics
-    summary_df = pd.DataFrame([{
-        'test_cohort': cfg.TEST_COHORT,
-        'AUROC': auroc,
-        'AUROC_CI_lower': ci_auroc_lower,
-        'AUROC_CI_upper': ci_auroc_upper,
-        'AUPRC': auprc,
-        'AUPRC_CI_lower': ci_auprc_lower,
-        'AUPRC_CI_upper': ci_auprc_upper}])
 
-    summary_path = os.path.join(summary_dir, f'{cfg.EXPERIMENT_NAME}.csv')
-    summary_df.to_csv(summary_path, index=False)
-    print(f"Summary metrics saved to {summary_path}")
-    
-    # Plot ROC curve
-    roc_path = os.path.join(roc_dir, f'{cfg.EXPERIMENT_NAME}.png')
-    plot_roc_curve(y_true, y_score, cfg.TEST_COHORT, save_path=roc_path)
-    
-    # Plot PRC curve
-    prc_path = os.path.join(prc_dir, f'{cfg.EXPERIMENT_NAME}.png')
-    plot_prc_curve(y_true, y_score, cfg.TEST_COHORT, save_path=prc_path)
-    
-    # Plot confusion matrix
-    cm_path = os.path.join(cm_dir, f'{cfg.EXPERIMENT_NAME}.png')
-    cm_metrics = plot_confusion_matrix(y_true, y_score, threshold='youden', save_path=cm_path)
-    
-    # Save confusion matrix metrics
-    cm_df = pd.DataFrame([cm_metrics])
-    cm_metrics_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}.csv')
-    cm_df.to_csv(cm_metrics_path, index=False)
-    print(f"Confusion matrix metrics saved to {cm_metrics_path}")
-    
-    # Find and save optimal thresholds
-    print("\n" + "="*70)
-    print("FINDING OPTIMAL THRESHOLDS")
-    print("="*70)
-    thresholds_dict = find_optimal_thresholds(y_true, y_score)
-    thresholds_df = pd.DataFrame([thresholds_dict])
-    thresholds_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}_thresholds.csv')
-    thresholds_df.to_csv(thresholds_path, index=False)
-    print(f"Optimal thresholds saved to {thresholds_path}")
-    
-    print("\nOptimal Thresholds:")
-    for method, value in thresholds_dict.items():
-        if 'threshold' in method.lower():
-            print(f"  {method}: {value:.4f}")
-    
-    # Plot Kaplan-Meier curve if enabled
-    if hasattr(cfg, 'KAPLAN_MEIER') and cfg.KAPLAN_MEIER:
+    if n_classes == 2:
+        y_score = y_prob[:, 1]
+        auroc = roc_auc_score(y_true, y_score)
+        auprc = average_precision_score(y_true, y_score)
+
+        bootstrapped_auroc = []
+        bootstrapped_auprc = []
+        rng = np.random.RandomState(42)
+
+        for _ in range(1000):
+            indices = rng.randint(0, len(y_true), len(y_true))
+            y_true_sample = y_true[indices]
+            y_score_sample = y_score[indices]
+
+            if len(np.unique(y_true_sample)) < 2:
+                continue
+
+            bootstrapped_auroc.append(roc_auc_score(y_true_sample, y_score_sample))
+            bootstrapped_auprc.append(average_precision_score(y_true_sample, y_score_sample))
+
+        ci_auroc_lower = np.percentile(bootstrapped_auroc, 2.5)
+        ci_auroc_upper = np.percentile(bootstrapped_auroc, 97.5)
+        ci_auprc_lower = np.percentile(bootstrapped_auprc, 2.5)
+        ci_auprc_upper = np.percentile(bootstrapped_auprc, 97.5)
+
         print("\n" + "="*70)
-        print("KAPLAN-MEIER ANALYSIS")
+        print("CLASSIFICATION RESULTS (BINARY)")
         print("="*70)
-        
-        km_dir = os.path.join(log_dir, 'kaplan_meier', subdir)
-        os.makedirs(km_dir, exist_ok=True)
-        
-        # Read the original CSV to get survival data
-        test_csv = pd.read_csv(cfg.CSV_TEST)
-        
-        # Merge with predictions
-        km_data = test_csv.merge(predictions_df, on='eid', how='inner')
-        
-        # Check if required columns exist ('time' and cfg.COLUMN_NAME)
-        if 'time' in km_data.columns:
-            time_to_event = km_data['time'].values
-            event_observed = km_data['label'].values  # Use label from predictions_df (same as cfg.COLUMN_NAME)
-            prediction_scores = km_data['prediction'].values
-            
-            # Use Youden's threshold
-            km_threshold = thresholds_dict['youden_threshold']
-            print(f"Using Youden's threshold: {km_threshold:.4f}")
-            
-            # Plot Kaplan-Meier curve
-            km_path = os.path.join(km_dir, f'{cfg.EXPERIMENT_NAME}.png')
-            km_metrics = plot_kaplan_meier(
-                time_to_event, 
-                event_observed, 
-                prediction_scores,
-                cfg.TEST_COHORT,
-                threshold=km_threshold,
-                save_path=km_path
-            )
-            
-            # Calculate Hazard Ratio
-            from lifelines import CoxPHFitter
-            
-            cox_df = pd.DataFrame({
-                'time': time_to_event,
-                'event': event_observed,
-                'high_risk': (prediction_scores >= km_threshold).astype(int)
-            })
-            
-            try:
-                cph = CoxPHFitter()
-                cph.fit(cox_df, duration_col='time', event_col='event')
-                
-                hr = np.exp(cph.params_['high_risk'])
-                hr_ci_lower = np.exp(cph.confidence_intervals_['95% lower-bound']['high_risk'])
-                hr_ci_upper = np.exp(cph.confidence_intervals_['95% upper-bound']['high_risk'])
-                hr_p_value = cph.summary.loc['high_risk', 'p']
-                
-                # Add HR to metrics
-                km_metrics['hazard_ratio'] = hr
-                km_metrics['hr_ci_lower'] = hr_ci_lower
-                km_metrics['hr_ci_upper'] = hr_ci_upper
-                km_metrics['hr_p_value'] = hr_p_value
-                
-                print(f"\nHazard Ratio (High Risk vs Low Risk):")
-                print(f"  HR = {hr:.3f} (95% CI: {hr_ci_lower:.3f} - {hr_ci_upper:.3f})")
-                print(f"  p-value = {hr_p_value:.4f}")
-                
-            except Exception as e:
-                print(f"\nWarning: Could not calculate Hazard Ratio: {e}")
-            
-            # Save KM metrics (now includes HR if calculated)
-            km_metrics_df = pd.DataFrame([km_metrics])
-            km_metrics_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}_km.csv')
-            km_metrics_df.to_csv(km_metrics_path, index=False)
-            print(f"Kaplan-Meier metrics saved to {km_metrics_path}")
-            
-            print(f"\nKaplan-Meier Results:")
-            print(f"  Threshold: {km_metrics['threshold']:.4f}")
-            print(f"  Low Risk: n={km_metrics['n_low_risk']}, events={km_metrics['events_low_risk']}")
-            print(f"  High Risk: n={km_metrics['n_high_risk']}, events={km_metrics['events_high_risk']}")
-            print(f"  Log-rank p-value: {km_metrics['logrank_p_value']:.4f}")
-        else:
-            print(f"Warning: 'time' column not found in CSV")
-            print(f"  Available columns: {km_data.columns.tolist()}")
-            print("Skipping Kaplan-Meier analysis")
-        
+        print(f"AUROC: {auroc:.3f} (95% CI: {ci_auroc_lower:.3f}–{ci_auroc_upper:.3f})")
+        print(f"AUPRC: {auprc:.3f} (95% CI: {ci_auprc_lower:.3f}–{ci_auprc_upper:.3f})")
         print("="*70)
-    
+
+        summary_df = pd.DataFrame([{
+            'test_cohort': cfg.TEST_COHORT,
+            'AUROC': auroc,
+            'AUROC_CI_lower': ci_auroc_lower,
+            'AUROC_CI_upper': ci_auroc_upper,
+            'AUPRC': auprc,
+            'AUPRC_CI_lower': ci_auprc_lower,
+            'AUPRC_CI_upper': ci_auprc_upper
+        }])
+        summary_path = os.path.join(summary_dir, f'{cfg.EXPERIMENT_NAME}.csv')
+        summary_df.to_csv(summary_path, index=False)
+        print(f"Summary metrics saved to {summary_path}")
+
+        roc_path = os.path.join(roc_dir, f'{cfg.EXPERIMENT_NAME}.png')
+        plot_roc_curve(y_true, y_score, cfg.TEST_COHORT, save_path=roc_path)
+
+        prc_path = os.path.join(prc_dir, f'{cfg.EXPERIMENT_NAME}.png')
+        plot_prc_curve(y_true, y_score, cfg.TEST_COHORT, save_path=prc_path)
+
+        cm_path = os.path.join(cm_dir, f'{cfg.EXPERIMENT_NAME}.png')
+        cm_metrics = plot_confusion_matrix(y_true, y_score, threshold='youden', save_path=cm_path)
+
+        cm_df = pd.DataFrame([cm_metrics])
+        cm_metrics_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}.csv')
+        cm_df.to_csv(cm_metrics_path, index=False)
+        print(f"Confusion matrix metrics saved to {cm_metrics_path}")
+
+        print("\n" + "="*70)
+        print("FINDING OPTIMAL THRESHOLDS")
+        print("="*70)
+        thresholds_dict = find_optimal_thresholds(y_true, y_score)
+        thresholds_df = pd.DataFrame([thresholds_dict])
+        thresholds_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}_thresholds.csv')
+        thresholds_df.to_csv(thresholds_path, index=False)
+        print(f"Optimal thresholds saved to {thresholds_path}")
+
+        print("\nOptimal Thresholds:")
+        for method, value in thresholds_dict.items():
+            if 'threshold' in method.lower():
+                print(f"  {method}: {value:.4f}")
+
+        if hasattr(cfg, 'KAPLAN_MEIER') and cfg.KAPLAN_MEIER:
+            print("\n" + "="*70)
+            print("KAPLAN-MEIER ANALYSIS")
+            print("="*70)
+
+            km_dir = os.path.join(log_dir, 'kaplan_meier', subdir)
+            os.makedirs(km_dir, exist_ok=True)
+            test_csv = pd.read_csv(cfg.CSV_TEST)
+            km_data = test_csv.merge(predictions_df, on='eid', how='inner')
+
+            if 'time' in km_data.columns:
+                time_to_event = km_data['time'].values
+                event_observed = km_data['label'].values
+                prediction_scores = km_data['prob_class_1'].values
+                km_threshold = thresholds_dict['youden_threshold']
+                print(f"Using Youden's threshold: {km_threshold:.4f}")
+
+                km_path = os.path.join(km_dir, f'{cfg.EXPERIMENT_NAME}.png')
+                km_metrics = plot_kaplan_meier(
+                    time_to_event,
+                    event_observed,
+                    prediction_scores,
+                    cfg.TEST_COHORT,
+                    threshold=km_threshold,
+                    save_path=km_path
+                )
+
+                from lifelines import CoxPHFitter
+                cox_df = pd.DataFrame({
+                    'time': time_to_event,
+                    'event': event_observed,
+                    'high_risk': (prediction_scores >= km_threshold).astype(int)
+                })
+
+                try:
+                    cph = CoxPHFitter()
+                    cph.fit(cox_df, duration_col='time', event_col='event')
+
+                    hr = np.exp(cph.params_['high_risk'])
+                    hr_ci_lower = np.exp(cph.confidence_intervals_['95% lower-bound']['high_risk'])
+                    hr_ci_upper = np.exp(cph.confidence_intervals_['95% upper-bound']['high_risk'])
+                    hr_p_value = cph.summary.loc['high_risk', 'p']
+
+                    km_metrics['hazard_ratio'] = hr
+                    km_metrics['hr_ci_lower'] = hr_ci_lower
+                    km_metrics['hr_ci_upper'] = hr_ci_upper
+                    km_metrics['hr_p_value'] = hr_p_value
+
+                    print(f"\nHazard Ratio (High Risk vs Low Risk):")
+                    print(f"  HR = {hr:.3f} (95% CI: {hr_ci_lower:.3f} - {hr_ci_upper:.3f})")
+                    print(f"  p-value = {hr_p_value:.4f}")
+                except Exception as e:
+                    print(f"\nWarning: Could not calculate Hazard Ratio: {e}")
+
+                km_metrics_df = pd.DataFrame([km_metrics])
+                km_metrics_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}_km.csv')
+                km_metrics_df.to_csv(km_metrics_path, index=False)
+                print(f"Kaplan-Meier metrics saved to {km_metrics_path}")
+            else:
+                print(f"Warning: 'time' column not found in CSV")
+                print(f"  Available columns: {km_data.columns.tolist()}")
+                print("Skipping Kaplan-Meier analysis")
+
+            print("="*70)
+    else:
+        acc = accuracy_score(y_true, y_pred)
+        bacc = balanced_accuracy_score(y_true, y_pred)
+        prec_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+        rec_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+        f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+        try:
+            auroc_macro_ovr = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
+        except ValueError:
+            auroc_macro_ovr = np.nan
+
+        y_true_binarized = label_binarize(y_true, classes=np.arange(n_classes))
+        try:
+            auprc_macro = average_precision_score(y_true_binarized, y_prob, average='macro')
+        except ValueError:
+            auprc_macro = np.nan
+
+        print("\n" + "="*70)
+        print(f"CLASSIFICATION RESULTS (MULTICLASS, {n_classes} CLASSES)")
+        print("="*70)
+        print(f"Accuracy: {acc:.3f}")
+        print(f"Balanced Accuracy: {bacc:.3f}")
+        print(f"Precision (macro): {prec_macro:.3f}")
+        print(f"Recall (macro): {rec_macro:.3f}")
+        print(f"F1 (macro): {f1_macro:.3f}")
+        print(f"AUROC (macro, OVR): {auroc_macro_ovr:.3f}" if np.isfinite(auroc_macro_ovr) else "AUROC (macro, OVR): nan")
+        print(f"AUPRC (macro): {auprc_macro:.3f}" if np.isfinite(auprc_macro) else "AUPRC (macro): nan")
+        print("="*70)
+
+        report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+        report_df = pd.DataFrame(report).transpose()
+        report_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}_report.csv')
+        report_df.to_csv(report_path)
+        print(f"Per-class report saved to {report_path}")
+
+        cm_path = os.path.join(cm_dir, f'{cfg.EXPERIMENT_NAME}.png')
+        cm_metrics = plot_multiclass_confusion_matrix(y_true, y_pred, n_classes, save_path=cm_path)
+
+        summary_dict = {
+            'test_cohort': cfg.TEST_COHORT,
+            'n_classes': n_classes,
+            'accuracy': acc,
+            'balanced_accuracy': bacc,
+            'precision_macro': prec_macro,
+            'recall_macro': rec_macro,
+            'f1_macro': f1_macro,
+            'auroc_macro_ovr': auroc_macro_ovr,
+            'auprc_macro': auprc_macro,
+            **cm_metrics,
+        }
+        metrics_df = pd.DataFrame([summary_dict])
+        metrics_path = os.path.join(metrics_dir, f'{cfg.EXPERIMENT_NAME}.csv')
+        metrics_df.to_csv(metrics_path, index=False)
+        print(f"Metrics saved to {metrics_path}")
+
+        summary_df = pd.DataFrame([summary_dict])
+        summary_path = os.path.join(summary_dir, f'{cfg.EXPERIMENT_NAME}.csv')
+        summary_df.to_csv(summary_path, index=False)
+        print(f"Summary metrics saved to {summary_path}")
+
     print("\nTesting completed!")
     return summary_df
 
 def test_regression_metrics(y_true, y_pred, test_eids, test_labels, output_dir, log_dir, subdir, val_loader=None, device=None, model=None):
     """Calculate and save regression metrics"""
     print("\nCalculating regression metrics...")
+
+    # Filter out non-finite values to avoid sklearn errors
+    finite_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    if not np.all(finite_mask):
+        num_bad = int(np.size(finite_mask) - np.sum(finite_mask))
+        print(f"Warning: Found {num_bad} non-finite predictions/labels; filtering for metrics.")
+        y_true = y_true[finite_mask]
+        y_pred = y_pred[finite_mask]
+        test_eids = np.array(test_eids)[finite_mask].tolist()
+        test_labels = np.array(test_labels)[finite_mask].tolist()
+        if y_true.size == 0:
+            raise ValueError("All regression predictions/labels are non-finite after filtering.")
     
     # Calculate raw regression metrics (before correction)
     mse_raw = mean_squared_error(y_true, y_pred)
@@ -1224,11 +1343,24 @@ def test_regression_metrics(y_true, y_pred, test_eids, test_labels, output_dir, 
                 y_true, y_pred, coefficients=bias_correction_coeffs, fit_on_data=False
             )
         else:
-            print("⚠️  No bias correction coefficients available.")
+            print("No bias correction coefficients available.")
             print("   Skipping bias correction for this test run.\n")
     else:
         print("\nBias correction disabled (cfg.APPLY_BIAS_CORRECTION=False).")
     
+    # Filter again after correction (correction can introduce non-finite values)
+    finite_mask_corrected = np.isfinite(y_true) & np.isfinite(y_pred_corrected)
+    if not np.all(finite_mask_corrected):
+        num_bad = int(np.size(finite_mask_corrected) - np.sum(finite_mask_corrected))
+        print(f"Warning: Found {num_bad} non-finite corrected predictions; filtering for metrics/plots.")
+        y_true = y_true[finite_mask_corrected]
+        y_pred = y_pred[finite_mask_corrected]
+        y_pred_corrected = y_pred_corrected[finite_mask_corrected]
+        test_eids = np.array(test_eids)[finite_mask_corrected].tolist()
+        test_labels = np.array(test_labels)[finite_mask_corrected].tolist()
+        if y_true.size == 0:
+            raise ValueError("All corrected predictions are non-finite after filtering.")
+
     # Calculate corrected metrics
     mse_corrected = mean_squared_error(y_true, y_pred_corrected)
     rmse_corrected = np.sqrt(mse_corrected)
@@ -1238,8 +1370,14 @@ def test_regression_metrics(y_true, y_pred, test_eids, test_labels, output_dir, 
     spearman_r_corrected, spearman_p_corrected = spearmanr(y_true, y_pred_corrected)
     
     # Calculate MAPE - corrected
-    if non_zero_mask.sum() > 0:
-        mape_corrected = np.mean(np.abs((y_true[non_zero_mask] - y_pred_corrected[non_zero_mask]) / np.abs(y_true[non_zero_mask]))) * 100
+    non_zero_mask_corrected = y_true != 0
+    if non_zero_mask_corrected.sum() > 0:
+        mape_corrected = np.mean(
+            np.abs(
+                (y_true[non_zero_mask_corrected] - y_pred_corrected[non_zero_mask_corrected])
+                / np.abs(y_true[non_zero_mask_corrected])
+            )
+        ) * 100
     else:
         mape_corrected = np.nan
     
