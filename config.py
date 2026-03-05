@@ -24,7 +24,7 @@ parser = argparse.ArgumentParser(description='Brain MRI Classification Training'
 parser.add_argument('-c', '--column', type=str, default=None,
                     help='Target column for training (default: label)')
 parser.add_argument('-m', '--mode', type=str, default=None,
-                    choices=['sfcn', 'dense', 'linear', 'ssl-finetuned', 'lora'],
+                    choices=['sfcn', 'dense', 'swin', 'linear', 'ssl-finetuned', 'lora'],
                     help='Training mode (default: lora)')
 parser.add_argument('-g', '--gpu', type=str, default=None,
                     help='GPU device (e.g., "cuda:0", default: cuda:0)')
@@ -37,13 +37,18 @@ args = parser.parse_args()
 # Task Configuration
 COLUMN_NAME = args.column if args.column else 'label'
 TRAINING_MODE = args.mode if args.mode else 'lora'
-TASK = 'classification'
+TASK = 'regression' if COLUMN_NAME == 'age' else 'classification'
 
 # Cohort Configuration
-TRAIN_COHORT = 'nifd-m0'
-TEST_COHORT = 'BrainLat'
-CSV_NAME_TRAIN = 'ftd-cn'
-CSV_NAME_TEST = 'ftd-cn'
+TRAIN_COHORT = 'ukb'
+TEST_COHORT = 'ukb'
+CSV_NAME_TRAIN = 'demographics'
+CSV_NAME_TEST = 'demographics'
+
+# Image Parameters
+IMG_SIZE = 180
+N_CHANNELS = 1
+N_CLASSES = 2
 
 # ============================================================================
 # DATA PATHS
@@ -56,17 +61,12 @@ CSV_VAL = f'../data/{TRAIN_COHORT}/val/{CSV_NAME_TRAIN}.csv'
 CSV_TEST = f'../data/{TEST_COHORT}/test/{CSV_NAME_TEST}.csv'
 
 # Image Directories
-TENSOR_DIR = f'../images/{TRAIN_COHORT}/npy96'
-TENSOR_DIR_TEST = f'../images/{TEST_COHORT}/npy96'
+TENSOR_DIR = f'../images/{TRAIN_COHORT}/npy{IMG_SIZE}'
+TENSOR_DIR_TEST = f'../images/{TEST_COHORT}/npy{IMG_SIZE}'
 
 # ============================================================================
 # MODEL ARCHITECTURE SETTINGS
 # ============================================================================
-
-# Image Parameters
-IMG_SIZE = 96
-N_CHANNELS = 1
-N_CLASSES = 2
 
 # LoRA (Low-Rank Adaptation) Parameters
 # Rank determines the dimensionality of the low-rank matrices
@@ -92,11 +92,11 @@ PRETRAINED_MODEL = (
 # Basic Training Parameters
 BATCH_SIZE = 16
 NUM_EPOCHS = 1000
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.1
 NUM_WORKERS = 8
 DEVICE = args.gpu if args.gpu else "cuda:0"
 SEED = 42
-NROWS: Optional[int] = None  # Set to int for subset, None for all data
+NROWS: Optional[int] = 100  # Set to int for subset, None for all data
 
 # Learning Rate Finder
 USE_LR_FINDER = True
@@ -116,10 +116,8 @@ SCHEDULER_PATIENCE = 3  # Number of epochs with no improvement
 # Experiment Naming
 # Safely construct experiment name
 _lora_modules_str = "_".join(LORA_TARGET_MODULES).replace(".", "-")
-EXPERIMENT_NAME = (
-    f"{CSV_NAME_TRAIN}_b{BATCH_SIZE}_lr{LEARNING_RATE}_"
-    f"ssl-{SSL_COHORT}_lora-{_lora_modules_str}"
-)
+EXPERIMENT_NAME = f"{COLUMN_NAME}_b{BATCH_SIZE}_lr{LEARNING_RATE}_e{NUM_EPOCHS}_im{IMG_SIZE}"
+#EXPERIMENT_NAME = f"{COLUMN_NAME}_b{BATCH_SIZE}_lr{LEARNING_RATE}"
 
 # Output Directories
 MODEL_DIR = '../models'
@@ -130,6 +128,13 @@ EXPLAINABILITY_DIR = '../explainability'
 
 # Additional Options
 KAPLAN_MEIER = False
+
+# Bias Correction for Regression (Age Prediction)
+# If True: Bias correction model is fitted on validation set during training
+# and applied to test set. This prevents information leakage.
+# If False: No bias correction is applied
+APPLY_BIAS_CORRECTION = True
+BIAS_CORRECTION_COEFFICIENTS_PATH = f'{SCORES_DIR}/{TRAINING_MODE}/val/bias_coeff_{EXPERIMENT_NAME}.json'
 
 # ============================================================================
 # EXPLAINABILITY & HEATMAP CONFIGURATION
@@ -142,13 +147,20 @@ HEATMAP_TOP_N = 5
 # Attention Method
 ATTENTION_METHOD = 'saliency'  # Options: 'saliency', 'gradcam'
 ATTENTION_MODE = 'magnitude'  # Options: 'magnitude', 'signed'
-ATTENTION_TARGET = 'logit_diff'  # Options: 'logit_diff', 'pred', 'target_class'
+if TASK == 'regression':
+    ATTENTION_TARGET = 'output'  # Options: 'output', 'loss'
+else:
+    ATTENTION_TARGET = 'pred'  # Options: 'logit_diff', 'pred', 'target_class', 'loss'
 ATTENTION_CLASS_IDX: Optional[int] = None
+
+# Swin Transformer parameters (override auto selection)
+SWIN_PATCH_SIZE = [4, 4, 4]
+SWIN_WINDOW_SIZE = [9, 9, 9]
 
 # Brain Atlas Configuration
 ATLAS_TYPE = 'AAL'  # Automated Anatomical Labeling
-ATLAS_PATH = '../utils/aal3_resampled_96.nii.gz'
-N_REGIONS = 100  # Number of top regions to analyze
+ATLAS_PATH = 'utils/aal3_resampled_96.nii.gz'
+N_REGIONS = None  # Number of top regions to analyze
 
 # ============================================================================
 # SSL (SELF-SUPERVISED LEARNING) CONFIGURATION
@@ -223,7 +235,7 @@ DIAGNOSIS_COLORS: Dict[str, str] = {
 }
 
 # Feature Extraction Paths
-IMAGES_EXT_DIR = f'../images/{COHORT_EXTRACT}/npy96/'
+IMAGES_EXT_DIR = f'../images/{COHORT_EXTRACT}/npy{IMG_SIZE}/'
 FEATURES_EXT_DIR = f'../features/{COHORT_EXTRACT}/{MODEL_TYPE_SSL}/'
 VIZ_DIR = (
     f'../representations/{COHORT_EXTRACT}/{MODEL_TYPE_SSL}/'
@@ -236,10 +248,10 @@ DATA_PATH_EXTRACT = f'../data/{COHORT_EXTRACT}/{CSV_NAME_EXTRACT}.csv'
 # ============================================================================
 
 # Cohort Configuration
-PREPROCESS_COHORT = 'trial'
+PREPROCESS_COHORT = 'ukb'
 REGISTRATION_TYPE = 'Affine'  # Registration algorithm type
 CROP_SIZE = 180  # Size before downsampling
-PREPROCESS_IMG_SIZE = 96  # Final image size
+PREPROCESS_IMG_SIZE = 180  # Final image size
 
 # Template and Tools
 TEMPLATE_PATH = '../images/templates/mni_icbm152_nlin_asym_09c/mni_icbm152_t1_tal_nlin_asym_09c.nii'

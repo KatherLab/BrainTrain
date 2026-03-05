@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import config as cfg
+import BrainTrain.config as cfg
 
 class ClassifierHeadMLP_(nn.Module):
     def __init__(self, backbone, output_dim=cfg.N_CLASSES):

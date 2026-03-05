@@ -18,6 +18,7 @@ class BrainDataset(Dataset):
         deterministic=True,
         num_rows=None,
         transform=None,
+        label_mapping=None,
     ):
         # Load the CSV file
         full_annotations = pd.read_csv(csv_file, dtype={"eid": str})
@@ -41,6 +42,10 @@ class BrainDataset(Dataset):
             raise ValueError("Invalid task, must be 'classification' or 'regression'.")
         self.task = task
         self.num_classes = num_classes
+        self.label_mapping = (
+            {str(k).strip(): int(v) for k, v in label_mapping.items()}
+            if label_mapping is not None else None
+        )
 
     def __len__(self):
         return len(self.annotations)
