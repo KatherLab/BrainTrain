@@ -5,11 +5,12 @@ This module handles all configuration settings including:
 - Command-line argument parsing
 - Data paths and cohort settings
 - Model architecture parameters
-- Training hyperparameters
+- Training hyperparameter
+- Test outputs and scores
 - Explainability and visualization settings
 
 Usage:
-    python train.py -c label -m lora -g cuda:0
+    python train.py -c age -m sfcn -g cuda:0
 """
 import argparse
 import os
